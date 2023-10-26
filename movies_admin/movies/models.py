@@ -56,6 +56,9 @@ class FilmWork(UUIDMixin, TimeStampedMixin):
         db_table = 'content"."film_work'
         verbose_name = "Фильм"
         verbose_name_plural = "Фильмы"
+        indexes = [
+            models.Index(fields=["creation_date"], name="film_work_creation_date_idx"),
+        ]
 
 
 class GenreFilmwork(UUIDMixin):
@@ -65,6 +68,9 @@ class GenreFilmwork(UUIDMixin):
 
     class Meta:
         db_table = 'content"."genre_film_work'
+        constraints = [
+            models.UniqueConstraint(["film_work", "genre"], name="film_work_genre_idx"),
+        ]
 
 
 class Person(UUIDMixin, TimeStampedMixin):
@@ -77,10 +83,18 @@ class Person(UUIDMixin, TimeStampedMixin):
 
 
 class PersonFilmwork(UUIDMixin):
+    class Roles(models.TextChoices):
+        ACTOR = "actor", "Актер"
+        WRITER = "writer", "Сценарист"
+        DIRECTOR = "director", "Режиссер"
+
     film_work = models.ForeignKey("Filmwork", on_delete=models.CASCADE)
     person = models.ForeignKey("Person", on_delete=models.CASCADE)
-    role = models.TextField(_("role"), null=True)
+    role = models.TextField(_("role"), null=True, choices=Roles.choices)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         db_table = 'content"."person_film_work'
+        constraints = [
+            models.UniqueConstraint(["film_work", "person", "role"], name="film_work_person_idx"),
+        ]

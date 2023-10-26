@@ -1,5 +1,9 @@
+import csv
+import os
 import sqlite3
-from dataclasses import astuple, fields
+from dotenv import load_dotenv
+from loguru import logger as logging
+import tempfile
 
 import psycopg2
 from psycopg2.extensions import connection as _connection
@@ -25,81 +29,82 @@ tables_to_extract = {
 
 
 class SQLiteExtractor:
-    def __init__(self, connection: sqlite3.Connection, tables: dict):
+    def __init__(self, connection: sqlite3.Connection, tables: dict, postgres_saver: 'PostgresSaver'):
         self.connection = connection
         self.tables = tables
-        self.data = {}
+        self.postgres_saver = postgres_saver
 
-    def _extract_table(self, table_name: str, model: type):
+    def _extract_table(self, table_name: str):
+        self.postgres_saver.prepare_table(table_name)
         curs = self.connection.cursor()
         curs.execute(f"SELECT * FROM {table_name};")
-        data = curs.fetchall()
         column_names = [desc[0] for desc in curs.description]
-        result_dicts = [dict(zip(column_names, row)) for row in data]
-        objects = [model(**row) for row in result_dicts]
-        self.data[table_name] = objects
+        with tempfile.NamedTemporaryFile(mode='w', delete=False) as temp_file:
+            csv_writer = csv.writer(temp_file, delimiter='\t', escapechar='\\', quoting=csv.QUOTE_NONE)
+            while True:
+                data = curs.fetchmany(1000)
+
+                if not data:
+                    break
+
+                for row in data:
+                    csv_writer.writerow(row)
+
+        self.postgres_saver.save_from_file(temp_file.name, table_name, column_names)
 
     def extract(self):
         for table_name, model in tqdm(self.tables.items(), colour="green"):
-            self._extract_table(table_name, model)
-
-        return self.data
+            self._extract_table(table_name)
 
 
 class PostgresSaver:
     def __init__(self, connection: _connection):
         self.connection = connection
 
-    def _save_table(self, table_name: str, objects: list):
+    def save_from_file(self, file, table, column_names):
         curs = self.connection.cursor()
-        for obj in objects:
-            columns = list(obj.model_dump(exclude_none=True).keys())
-            column_names = ",".join(columns)
-            bind_values = tuple(
-                str(value) for value in obj.model_dump(exclude_none=True).values()
-            )
-            col_count = ", ".join(["%s"] * len(columns))  # '%s, %s
-
-            query = (
-                f"INSERT INTO content.{table_name} ({column_names}) VALUES ({col_count})"
-                f" ON CONFLICT (id) DO NOTHING"
-            )
-            curs.execute(query, bind_values)
+        try:
+            with open(file, 'r') as f:
+                curs.copy_from(f, table, sep='\t', null='', columns=column_names)
+        finally:
+            os.remove(file)
         self.connection.commit()
 
-    def _prepare_table(self, table_name: str):
+    def prepare_table(self, table_name: str):
         curs = self.connection.cursor()
         curs.execute(f"TRUNCATE TABLE content.{table_name} CASCADE;")
         self.connection.commit()
 
-    def save_all_data(self, data: dict):
-        for table_name, objects in tqdm(data.items(), colour="green"):
-            self._prepare_table(table_name)
-            self._save_table(table_name, objects)
-
 
 def load_from_sqlite(connection: sqlite3.Connection, pg_conn: _connection):
-    """Основной метод загрузки данных из SQLite в Postgres"""
     postgres_saver = PostgresSaver(pg_conn)
-    sqlite_extractor = SQLiteExtractor(connection, tables_to_extract)
+    sqlite_extractor = SQLiteExtractor(connection, tables_to_extract, postgres_saver)
 
-    print("Loading data from SQLite to Postgres...")
-    data = sqlite_extractor.extract()
-    postgres_saver.save_all_data(data)
-    print("Data loaded successfully")
+    logging.info("Loading data from SQLite to Postgres...")
+    sqlite_extractor.extract()
+    logging.info("Data loaded successfully")
 
 
 if __name__ == "__main__":
+    load_dotenv()
+
     dsl = {
-        "dbname": "movies_database",
-        "user": "app",
-        "password": "123qwe",
-        "host": "127.0.0.1",
-        "port": 5432,
+        "dbname": os.environ.get("DB_NAME"),
+        "user": os.environ.get("DB_USER"),
+        "password": os.environ.get("DB_PASSWORD"),
+        "host": os.environ.get("DB_HOST"),
+        "port": os.environ.get("DB_PORT"),
+        'options': '-c search_path=public,content'
     }
-    with sqlite3.connect("db.sqlite") as sqlite_conn, psycopg2.connect(
-        **dsl, cursor_factory=DictCursor
-    ) as pg_conn:
-        load_from_sqlite(sqlite_conn, pg_conn)
+
+    sqlite_conn = sqlite3.connect("db.sqlite")
+    pg_conn = psycopg2.connect(**dsl, cursor_factory=DictCursor)
+
+    try:
+        with sqlite_conn, pg_conn:
+            load_from_sqlite(sqlite_conn, pg_conn)
+    finally:
+        sqlite_conn.close()
+        pg_conn.close()
 
     test_check_consistency()
